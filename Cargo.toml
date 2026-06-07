@@ -1,0 +1,8 @@
+[package]
+name = "agent-homeostasis-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Homeostatic regulation for agent systems — maintaining stable internal conditions with PID-inspired control loops"
+license = "MIT"
+
+[dependencies]
