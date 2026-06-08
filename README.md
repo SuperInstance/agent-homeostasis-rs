@@ -1,264 +1,271 @@
 # agent-homeostasis-rs
 
-Homeostatic regulation for agent systems. PID-inspired control loops, sensor arrays with noise, actuators with dead zones, and setpoint tracking — the machinery that keeps agents stable.
+Homeostatic regulation for agent systems — maintaining stable internal conditions with PID-inspired control loops, sensor arrays, actuator feedback, and setpoint tracking.
 
-## The Core Idea
+## What It Does
 
-Biological systems maintain homeostasis: temperature, blood sugar, hydration stay within bounds despite perturbations. Agent systems need the same thing. Compute budgets, error rates, latency, memory — all must converge to setpoints or the agent degrades.
+Biological systems maintain homeostasis: temperature, blood sugar, pH all stay within narrow ranges despite external perturbations. This crate gives AI agents the same capability. Each agent parameter (energy, attention, throughput, etc.) has a target setpoint, a sensor to measure it, and an actuator to correct deviations — all wired together through a PID control loop.
 
-This crate provides the building blocks:
+Core modules:
 
-- **Setpoint**: target value + tolerance band + drift
-- **Sensor**: reads parameters with configurable noise
-- **Actuator**: computes corrective actions with gain and dead zones
-- **PID Controller**: proportional + integral + derivative with anti-windup
-- **Regulator**: ties setpoints, sensors, and actuators together
-- **Control Loop**: multi-parameter PID simulation
+- **`regulator`** — `HomeostaticRegulator` monitors multiple parameters, compares against setpoints, generates corrective actions
+- **`sensor`** — `Sensor` / `SensorArray` with configurable noise modeling
+- **`actuator`** — `Actuator` with dead zones, gain, and magnitude limits
+- **`control_loop`** — `PidController` with anti-windup, output clamping, multi-parameter simulation
+- **`setpoint`** — `Setpoint` with tolerance bounds, drift, and tracking history
 
-## Architecture
+## Quick Start
 
-```
-agent-homeostasis-rs
-├── lib.rs          — Module declarations
-├── setpoint.rs     — Setpoint, SetpointTracker
-├── sensor.rs       — Sensor, SensorReading, SensorArray
-├── actuator.rs     — Actuator, Action, ActionType
-├── control_loop.rs — PidController, PidResult, ControlLoop
-└── regulator.rs    — HomeostaticRegulator, ParameterStatus, HealthStatus
-```
-
-## PID Controller Internals
-
-The PID controller is the heart of the crate. It computes three terms:
-
-```
-output = Kp * error + Ki * ∫error dt + Kd * d(error)/dt
+```toml
+[dependencies]
+agent-homeostasis-rs = { git = "https://github.com/SuperInstance/agent-homeostasis-rs" }
 ```
 
 ```rust
-use agent_homeostasis_rs::control_loop::PidController;
+use agent_homeostasis_rs::regulator::HomeostaticRegulator;
+use agent_homeostasis_rs::sensor::SensorReading;
+use agent_homeostasis_rs::setpoint::Setpoint;
+use agent_homeostasis_rs::actuator::Actuator;
 
-fn pid_basics() {
-    let mut pid = PidController::new("temperature", 2.0, 0.5, 0.1, 37.0);
+fn main() {
+    // Create a regulator with two parameters
+    let mut reg = HomeostaticRegulator::new();
+    reg.add_parameter(
+        Setpoint::new("temperature", 37.0, 1.0),      // target 37, ±1.0 tolerance
+        Actuator::new("temperature", 2.0, 0.5),        // max correction 2.0, gain 0.5
+    );
+    reg.add_parameter(
+        Setpoint::new("energy", 100.0, 10.0),          // target 100, ±10.0 tolerance
+        Actuator::new("energy", 5.0, 0.3),             // max correction 5.0, gain 0.3
+    );
 
-    // First measurement: 30.0°C (too cold)
-    let result = pid.update(30.0);
-    println!("Error: {:.1}", result.error);          // 7.0
-    println!("P term: {:.2}", result.p_term);         // 14.0
-    println!("I term: {:.2}", result.i_term);         // 3.5
-    println!("D term: {:.2}", result.d_term);         // 0.0 (first tick)
-    println!("Output: {:.2}", result.output);         // 17.5
+    // Feed sensor readings
+    let readings = vec![
+        SensorReading::perfect("temperature", 39.0),   // 2 above target
+        SensorReading::perfect("energy", 85.0),         // 15 below target
+    ];
 
-    // Second measurement: 35.0°C (getting closer)
-    let result = pid.update(35.0);
-    println!("Error: {:.1}", result.error);           // 2.0
-    println!("D term: {:.2}", result.d_term);         // 0.1 * (2.0 - 7.0) = -0.5
+    // One regulation cycle
+    let (statuses, new_values) = reg.cycle(&readings);
 
-    // Third measurement: 37.0°C (at setpoint)
-    let result = pid.update(37.0);
-    println!("Error: {:.1}", result.error);           // 0.0
-    println!("Output: {:.2}", result.output);         // small residual from I
-}
-```
-
-### Anti-Windup
-
-The integral term can accumulate to extreme values during sustained errors. Anti-windup clamps it:
-
-```rust
-use agent_homeostasis_rs::control_loop::PidController;
-
-fn anti_windup() {
-    let mut pid = PidController::new("budget", 0.0, 1.0, 0.0, 100.0)
-        .with_integral_limit(5.0);
-
-    // Sustained large error
-    pid.update(0.0); // error = 100, integral would be 100 but clamped to 5
-    let result = pid.update(0.0);
-    println!("I term (clamped): {:.1}", result.i_term); // 5.0
-
-    // Compare without clamping:
-    let mut pid_unclamped = PidController::new("budget", 0.0, 1.0, 0.0, 100.0);
-    pid_unclamped.update(0.0);
-    pid_unclamped.update(0.0);
-    // integral = 200, i_term = 200 — way too aggressive
-}
-```
-
-### Output Limiting
-
-```rust
-use agent_homeostasis_rs::control_loop::PidController;
-
-fn output_limit() {
-    let mut pid = PidController::new("rate", 10.0, 0.0, 0.0, 100.0)
-        .with_output_limit(5.0);
-
-    // Huge error, but output is clamped
-    let result = pid.update(0.0);
-    println!("Output (clamped): {:.1}", result.output); // 5.0
-    println!("Raw P term: {:.1}", result.p_term);      // 1000.0
-}
-```
-
-## Feedback Loops Converging
-
-The `ControlLoop::simulate` method runs a multi-step simulation showing convergence:
-
-```rust
-use agent_homeostasis_rs::control_loop::{PidController, ControlLoop};
-
-fn convergence_demo() {
-    let mut cl = ControlLoop::new();
-    cl.add(PidController::new("temperature", 0.5, 0.01, 0.1, 37.0));
-
-    // Start at 20°C, simulate 200 ticks
-    let trajectory = cl.simulate(&[20.0], 200);
-
-    println!("Step  0: {:.2}°C", trajectory[0][0]);
-    println!("Step 10: {:.2}°C", trajectory[10][0]);
-    println!("Step 50: {:.2}°C", trajectory[50][0]);
-    println!("Step200: {:.2}°C", trajectory[200][0]); // ~37.0
-
-    // Verify convergence
-    let final_temp = trajectory.last().unwrap()[0];
-    assert!((final_temp - 37.0).abs() < 2.0, "Should converge to 37°C");
-}
-```
-
-### Multi-Parameter Convergence
-
-```rust
-use agent_homeostasis_rs::control_loop::{PidController, ControlLoop};
-
-fn multi_param_convergence() {
-    let mut cl = ControlLoop::new();
-    cl.add(PidController::new("temperature", 0.5, 0.01, 0.1, 37.0));
-    cl.add(PidController::new("pressure", 0.3, 0.005, 0.05, 50.0));
-    cl.add(PidController::new("humidity", 0.4, 0.008, 0.08, 60.0));
-
-    // Start far from all setpoints
-    let trajectory = cl.simulate(&[20.0, 80.0, 30.0], 300);
-
-    let final = trajectory.last().unwrap();
-    println!("Temperature: {:.2}°C (target: 37.0)", final[0]);
-    println!("Pressure:    {:.2}    (target: 50.0)", final[1]);
-    println!("Humidity:    {:.2}%   (target: 60.0)", final[2]);
-
-    assert!((final[0] - 37.0).abs() < 5.0);
-    assert!((final[1] - 50.0).abs() < 5.0);
-    assert!((final[2] - 60.0).abs() < 5.0);
-}
-```
-
-## Sensor Arrays with Noise
-
-Sensors read true values but add noise. The `SensorArray` reads multiple parameters simultaneously:
-
-```rust
-use agent_homeostasis_rs::sensor::{Sensor, SensorReading, SensorArray};
-
-fn sensor_demo() {
-    // Noiseless sensor
-    let mut temp_sensor = Sensor::new("temperature");
-    let reading = temp_sensor.read(37.0);
-    println!("Noiseless: value={:.1}, noise={:.4}",
-        reading.value, reading.noise_applied);
-
-    // Noisy sensor
-    let mut noisy_sensor = Sensor::with_noise("temperature", 0.5);
-    let reading = noisy_sensor.read(37.0);
-    println!("Noisy: value={:.2}, noise={:.4}, SNR={:.1}",
-        reading.value, reading.noise_applied, reading.snr());
-
-    // Perfect reading (no sensor)
-    let perfect = SensorReading::perfect("temperature", 37.0);
-    assert!(perfect.snr().is_infinite());
-}
-```
-
-### Multi-Sensor Array
-
-```rust
-use agent_homeostasis_rs::sensor::{Sensor, SensorArray};
-
-fn sensor_array() {
-    let mut arr = SensorArray::new();
-    arr.add(Sensor::new("temperature"));        // noiseless
-    arr.add(Sensor::with_noise("pressure", 2.0)); // ±2.0 noise
-    arr.add(Sensor::with_noise("humidity", 3.0)); // ±3.0 noise
-
-    let true_values = [37.0, 101.3, 55.0];
-    let readings = arr.read_all(&true_values);
-
-    for r in &readings {
-        println!("{}: {:.2} (raw: {:.2}, noise: {:.2})",
-            r.sensor_name, r.value, r.raw_value, r.noise_applied);
+    for status in &statuses {
+        println!("{}: current={:.1} target={:.1} deviation={:.1} stable={}",
+            status.name, status.current, status.target, status.deviation, status.is_stable);
     }
 }
 ```
 
-## Actuators and Corrective Actions
+## PID Controller
 
-Actuators compute what to do about deviations:
+Proportional-Integral-Derivative controller adapted for agent parameters. Each term handles a different aspect of regulation:
+
+- **P (proportional):** Corrects based on current error magnitude
+- **I (integral):** Eliminates steady-state error by accumulating past errors
+- **D (derivative):** Anticipates future error by tracking rate of change
 
 ```rust
-use agent_homeostasis_rs::actuator::{Actuator, ActionType, Action};
+use agent_homeostasis_rs::control_loop::PidController;
 
-fn actuator_demo() {
-    let actuator = Actuator::new("temperature", 2.0, 0.5);
-    // max_correction=2.0, gain=0.5
+let mut pid = PidController::new("temperature", 0.5, 0.01, 0.1, 37.0);
+//                                      kp      ki    kd   target
 
-    // Positive deviation: value is above target, decrease
-    let action = actuator.compute_action(5.0);
-    assert_eq!(action.action_type, ActionType::Decrease);
-    println!("Deviation +5: {:?}, magnitude={:.2}", action.action_type, action.magnitude);
-    // magnitude = min(5.0 * 0.5, 2.0) = 2.0 (capped)
+let result = pid.update(35.0);
+println!("Output: {:.4}", result.output);     // correction to apply
+println!("Error:  {:.4}", result.error);      // target - measurement = 2.0
+println!("P term: {:.4}", result.p_term);     // 0.5 * 2.0 = 1.0
+println!("I term: {:.4}", result.i_term);     // small, just started
+println!("D term: {:.4}", result.d_term);     // 0 (first reading)
+```
 
-    // Negative deviation: value is below target, increase
-    let action = actuator.compute_action(-3.0);
-    assert_eq!(action.action_type, ActionType::Increase);
-    println!("Deviation -3: {:?}, magnitude={:.2}", action.action_type, action.magnitude);
-    // magnitude = min(3.0 * 0.5, 2.0) = 1.5
+### Anti-Windup
 
-    // Apply correction
-    let new_val = action.apply(34.0); // 34 + 1.5 = 35.5
-    println!("34.0 → {:.1}", new_val);
+The integral accumulator is clamped to prevent runaway accumulation:
+
+```rust
+use agent_homeostasis_rs::control_loop::PidController;
+
+let mut pid = PidController::new("energy", 0.0, 1.0, 0.0, 100.0)
+    .with_integral_limit(5.0);  // integral capped at ±5
+
+// Large sustained error won't cause windup
+for _ in 0..100 {
+    pid.update(0.0);  // error = 100 each time
 }
+let result = pid.update(0.0);
+println!("I term (clamped): {:.4}", result.i_term); // ≤ 5.0
+```
+
+### Output Clamping
+
+```rust
+let pid = PidController::new("attention", 10.0, 0.0, 0.0, 50.0)
+    .with_output_limit(3.0);  // max correction per tick = 3.0
+```
+
+### Setpoint Changes
+
+```rust
+let mut pid = PidController::new("throughput", 1.0, 0.1, 0.5, 100.0);
+pid.set_target(120.0);  // dynamically raise target
+pid.reset();            // clear integral and derivative state
+```
+
+## Multi-Parameter Control Loop
+
+Run multiple PID controllers in lockstep with a single `tick()` call.
+
+```rust
+use agent_homeostasis_rs::control_loop::{ControlLoop, PidController};
+
+let mut cl = ControlLoop::new();
+cl.add(PidController::new("temperature", 0.5, 0.01, 0.1, 37.0));
+cl.add(PidController::new("pressure",    0.3, 0.005, 0.05, 101.3));
+cl.add(PidController::new("energy",      0.8, 0.02, 0.2, 100.0));
+
+// One tick
+let measurements = vec![36.0, 102.0, 80.0];
+let results = cl.tick(&measurements);
+for r in &results {
+    println!("Output: {:.4}, Error: {:.4}", r.output, r.error);
+}
+```
+
+### Simulation
+
+Run a closed-loop simulation for N steps. Starting values converge toward setpoints.
+
+```rust
+use agent_homeostasis_rs::control_loop::{ControlLoop, PidController};
+
+let mut cl = ControlLoop::new();
+cl.add(PidController::new("temp", 0.5, 0.01, 0.1, 100.0));
+cl.add(PidController::new("pressure", 0.3, 0.005, 0.05, 50.0));
+
+let initial = vec![80.0, 30.0];
+let trajectory = cl.simulate(&initial, 200);
+
+println!("Step 0:  temp={:.2}, pressure={:.2}", trajectory[0][0], trajectory[0][1]);
+println!("Final:   temp={:.2}, pressure={:.2}", trajectory.last().unwrap()[0], trajectory.last().unwrap()[1]);
+// Both converge close to setpoints
+```
+
+## Sensors
+
+Sensors read parameter values with optional noise modeling.
+
+```rust
+use agent_homeostasis_rs::sensor::{Sensor, SensorReading};
+
+// Perfect (noiseless) sensor
+let mut s = Sensor::new("temperature");
+let reading = s.read(37.0);
+println!("Value: {:.2}, Noise: {:.4}", reading.value, reading.noise_applied);
+
+// Sensor with noise (σ = 0.5)
+let mut noisy = Sensor::with_noise("temperature", 0.5);
+let noisy_reading = noisy.read(37.0);
+println!("Noisy value: {:.2}", noisy_reading.value);
+println!("Signal-to-noise ratio: {:.1}", noisy_reading.snr());
+```
+
+### Sensor Readings
+
+```rust
+use agent_homeostasis_rs::sensor::SensorReading;
+
+// Create a perfect reading directly
+let r = SensorReading::perfect("energy", 95.0);
+assert_eq!(r.value, 95.0);
+assert!(r.snr().is_infinite());  // no noise → infinite SNR
+```
+
+### Sensor Array
+
+Read multiple parameters simultaneously:
+
+```rust
+use agent_homeostasis_rs::sensor::{SensorArray, Sensor};
+
+let mut array = SensorArray::new();
+array.add(Sensor::new("temperature"));
+array.add(Sensor::with_noise("pressure", 0.1));
+array.add(Sensor::new("energy"));
+
+let readings = array.read_all(&[37.0, 101.3, 85.0]);
+for r in &readings {
+    println!("{}: {:.2}", r.sensor_name, r.value);
+}
+```
+
+## Actuators
+
+Actuators compute corrective actions based on deviation from setpoint.
+
+```rust
+use agent_homeostasis_rs::actuator::{Actuator, ActionType};
+
+let act = Actuator::new("temperature", 2.0, 0.5); // max magnitude 2.0, gain 0.5
+
+// Deviation = 5.0 (above target)
+let action = act.compute_action(5.0);
+assert_eq!(action.action_type, ActionType::Decrease);
+println!("Magnitude: {:.2}", action.magnitude); // min(5.0 * 0.5, 2.0) = 2.0
+
+// Apply action
+let new_val = action.apply(42.0); // 42 - 2 = 40
 ```
 
 ### Dead Zone
 
+Small deviations within the dead zone produce no action:
+
+```rust
+use agent_homeostasis_rs::actuator::{Actuator, ActionType};
+
+let act = Actuator::new("energy", 5.0, 1.0).with_dead_zone(2.0);
+
+let action = act.compute_action(1.5); // within dead zone
+assert_eq!(action.action_type, ActionType::Hold);
+
+let action = act.compute_action(3.0); // outside dead zone
+assert_ne!(action.action_type, ActionType::Hold);
+```
+
+### Direct Correction
+
 ```rust
 use agent_homeostasis_rs::actuator::Actuator;
 
-fn dead_zone() {
-    let actuator = Actuator::new("temperature", 2.0, 0.5)
-        .with_dead_zone(1.0); // ignore deviations < 1.0
-
-    let action = actuator.compute_action(0.5); // within dead zone
-    assert_eq!(action.action_type, agent_homeostasis_rs::actuator::ActionType::Hold);
-}
+let act = Actuator::new("temp", 10.0, 0.5);
+let corrected = act.correct(40.0, 4.0); // current=40, deviation=4 → decrease by 2
+println!("Corrected: {:.1}", corrected); // 38.0
 ```
 
-## Setpoint Tracking
+## Setpoints
 
-Setpoints define targets, tolerance bands, and optional drift:
+Define target values and acceptable ranges for agent parameters.
 
 ```rust
-use agent_homeostasis_rs::setpoint::{Setpoint, SetpointTracker};
+use agent_homeostasis_rs::setpoint::Setpoint;
 
-fn setpoint_demo() {
-    let sp = Setpoint::new("temperature", 37.0, 1.0);
-    // Target 37.0, tolerance ±1.0 → acceptable range [36.0, 38.0]
+let sp = Setpoint::new("temperature", 37.0, 1.0);
+// target=37.0, acceptable range=[36.0, 38.0]
 
-    assert!(sp.is_satisfied(36.5));  // within range
-    assert!(sp.is_satisfied(38.0));  // at boundary
-    assert!(!sp.is_satisfied(39.0)); // outside
+assert!(sp.is_satisfied(37.0));
+assert!(sp.is_satisfied(36.5));
+assert!(!sp.is_satisfied(39.0));
 
-    println!("Deviation at 35: {:.1}", sp.deviation(35.0));   // -2.0
-    println!("Normalized at 38: {:.1}", sp.normalized_deviation(38.0)); // +1.0
-}
+println!("Deviation: {:.1}", sp.deviation(39.0));         // +2.0
+println!("Normalized: {:.2}", sp.normalized_deviation(38.0)); // +1.0 (at boundary)
+```
+
+### Asymmetric Bounds
+
+```rust
+use agent_homeostasis_rs::setpoint::Setpoint;
+
+let sp = Setpoint::with_bounds("energy", 100.0, 50.0, 120.0);
+// target=100, min=50, max=120
 ```
 
 ### Drifting Setpoints
@@ -266,237 +273,203 @@ fn setpoint_demo() {
 Setpoints can drift over time (simulating changing targets):
 
 ```rust
-use agent_homeostasis_rs::setpoint::{Setpoint, SetpointTracker};
+use agent_homeostasis_rs::setpoint::Setpoint;
 
-fn drifting_setpoint() {
-    let sp = Setpoint::new("load", 50.0, 5.0)
-        .with_drift(2.0)             // target increases by 2 per tick
-        .with_target_bounds(0.0, 100.0); // but never exceeds 100
-
-    let mut tracker = SetpointTracker::new(sp);
-    for tick in 0..10 {
-        let target = tracker.tick_drift();
-        tracker.observe(50.0 + tick as f64); // observations track the drift
-        println!("Tick {}: target={:.0}, satisfaction={:.0}%",
-            tick, target, tracker.satisfaction_rate() * 100.0);
-    }
-}
+let sp = Setpoint::new("throughput", 100.0, 5.0)
+    .with_drift(0.5)                     // target increases by 0.5 per tick
+    .with_target_bounds(80.0, 120.0);    // clamped to [80, 120]
 ```
 
-### Tracker Statistics
+### Setpoint Tracker
+
+Monitor satisfaction rate over time:
 
 ```rust
 use agent_homeostasis_rs::setpoint::{Setpoint, SetpointTracker};
 
-fn tracker_stats() {
-    let sp = Setpoint::new("temperature", 37.0, 2.0);
-    let mut tracker = SetpointTracker::new(sp);
+let sp = Setpoint::new("energy", 100.0, 10.0);
+let mut tracker = SetpointTracker::new(sp);
 
-    tracker.observe(36.0); // satisfied
-    tracker.observe(37.5); // satisfied
-    tracker.observe(38.5); // satisfied
-    tracker.observe(40.0); // not satisfied
-    tracker.observe(35.0); // satisfied
+tracker.observe(95.0);   // satisfied
+tracker.observe(105.0);  // satisfied
+tracker.observe(85.0);   // not satisfied (outside ±10)
+tracker.observe(110.0);  // satisfied
 
-    println!("Satisfaction rate: {:.0}%", tracker.satisfaction_rate() * 100.0); // 80%
-    println!("Mean deviation:    {:.2}", tracker.mean_deviation());
-    println!("Current value:     {:?}", tracker.current_value());
-}
+println!("Satisfaction rate: {:.1}%", tracker.satisfaction_rate() * 100.0); // 75%
+println!("Mean deviation: {:.1}", tracker.mean_deviation());
+println!("Current value: {:?}", tracker.current_value()); // Some(110.0)
+
+// Apply drift
+let new_target = tracker.tick_drift();
 ```
 
-## The Regulator: Full Feedback Loop
+## Homeostatic Regulator
 
-The `HomeostaticRegulator` ties everything together:
+The top-level regulator wires setpoints, actuators, and sensor readings together.
+
+```rust
+use agent_homeostasis_rs::regulator::{HomeostaticRegulator, HealthStatus};
+use agent_homeostasis_rs::sensor::SensorReading;
+use agent_homeostasis_rs::setpoint::Setpoint;
+use agent_homeostasis_rs::actuator::Actuator;
+
+let mut reg = HomeostaticRegulator::new();
+reg.add_parameter(
+    Setpoint::new("temperature", 37.0, 1.0),
+    Actuator::new("temperature", 2.0, 0.5),
+);
+reg.add_parameter(
+    Setpoint::new("energy", 100.0, 10.0),
+    Actuator::new("energy", 5.0, 0.3),
+);
+
+// Check health
+let readings = vec![
+    SensorReading::perfect("temperature", 37.0),
+    SensorReading::perfect("energy", 100.0),
+];
+let statuses = reg.regulate(&readings);
+assert_eq!(reg.health_status(&statuses), HealthStatus::Stable);
+```
+
+### Convergence Over Multiple Cycles
 
 ```rust
 use agent_homeostasis_rs::regulator::HomeostaticRegulator;
+use agent_homeostasis_rs::sensor::SensorReading;
 use agent_homeostasis_rs::setpoint::Setpoint;
 use agent_homeostasis_rs::actuator::Actuator;
-use agent_homeostasis_rs::sensor::SensorReading;
 
-fn regulated_agent() {
-    let mut reg = HomeostaticRegulator::new();
-    reg.add_parameter(
-        Setpoint::new("temperature", 37.0, 1.0),
-        Actuator::new("temperature", 2.0, 0.5),
-    );
-    reg.add_parameter(
-        Setpoint::new("energy", 100.0, 10.0),
-        Actuator::new("energy", 5.0, 0.3),
-    );
+let mut reg = HomeostaticRegulator::new();
+reg.add_parameter(
+    Setpoint::new("temp", 37.0, 1.0),
+    Actuator::new("temp", 2.0, 0.5),
+);
+reg.add_parameter(
+    Setpoint::new("energy", 100.0, 10.0),
+    Actuator::new("energy", 5.0, 0.3),
+);
 
-    // Readings: temperature is high, energy is low
-    let readings = vec![
-        SensorReading::perfect("temperature", 39.0), // 2 above target
-        SensorReading::perfect("energy", 90.0),       // 10 below target
-    ];
-
-    let (statuses, new_values) = reg.cycle(&readings);
-
-    for s in &statuses {
-        println!("{}: current={:.1} target={:.1} deviation={:.1} stable={}",
-            s.name, s.current, s.target, s.deviation, s.is_stable);
-        println!("  action: {:?}, magnitude={:.2}", s.action.action_type, s.action.magnitude);
-    }
-
-    println!("New temperature: {:.2}", new_values[0]); // < 39.0
-    println!("New energy:      {:.2}", new_values[1]); // > 90.0
+let mut values = vec![42.0, 80.0];
+for cycle in 0..100 {
+    let readings: Vec<SensorReading> = ["temp", "energy"]
+        .iter()
+        .zip(&values)
+        .map(|(&name, &v)| SensorReading::perfect(name, v))
+        .collect();
+    let (_, new_vals) = reg.cycle(&readings);
+    values = new_vals;
 }
+println!("After 100 cycles: temp={:.2}, energy={:.2}", values[0], values[1]);
+// Should converge toward 37.0 and 100.0
 ```
 
-### Multi-Agent Ecology Self-Regulating
+## Conservation Budgets
+
+Agent parameters under conservation law constraints use bounded setpoints and limited actuators. The combination of `with_target_bounds` and `Actuator::max_magnitude` ensures total resource consumption stays within budget.
 
 ```rust
-use agent_homeostasis_rs::regulator::HomeostaticRegulator;
 use agent_homeostasis_rs::setpoint::Setpoint;
 use agent_homeostasis_rs::actuator::Actuator;
-use agent_homeostasis_rs::sensor::SensorReading;
-use agent_homeostasis_rs::control_loop::HealthStatus;
 
-fn ecology() {
-    let mut reg = HomeostaticRegulator::new();
-    reg.add_parameter(
-        Setpoint::new("cpu_load", 0.6, 0.1),
-        Actuator::new("cpu_load", 0.2, 0.5),
-    );
-    reg.add_parameter(
-        Setpoint::new("memory", 0.7, 0.15),
-        Actuator::new("memory", 0.1, 0.3),
-    );
-    reg.add_parameter(
-        Setpoint::new("error_rate", 0.01, 0.02),
-        Actuator::new("error_rate", 0.05, 0.8),
-    );
+// Energy budget: target 100, must stay in [0, 200], max correction 5 per tick
+let energy_sp = Setpoint::new("energy", 100.0, 20.0)
+    .with_target_bounds(0.0, 200.0);
+let energy_act = Actuator::new("energy", 5.0, 0.3); // max 5, gain 0.3
 
-    // Simulate perturbation: CPU spike, memory leak
-    let mut values = vec![0.9, 0.95, 0.05];
-
-    for step in 0..50 {
-        let readings: Vec<SensorReading> = ["cpu_load", "memory", "error_rate"]
-            .iter()
-            .zip(&values)
-            .map(|(&name, &v)| SensorReading::perfect(name, v))
-            .collect();
-
-        let (statuses, new_values) = reg.cycle(&readings);
-        values = new_values;
-
-        if step % 10 == 0 {
-            let health = reg.health_status(&statuses);
-            println!("Step {:3}: cpu={:.2} mem={:.2} err={:.3} [{:?}]",
-                step, values[0], values[1], values[2], health);
-        }
-    }
-
-    // After 50 cycles, system should be converging toward setpoints
-    assert!(values[0] < 0.9); // CPU load decreased
-    assert!(values[1] < 0.95); // memory decreased
-}
+// Conservation law: total corrections across all agents must not exceed fleet budget
+let fleet_budget = 1000.0;
+let agent_max_correction = 5.0;
+let max_agents = (fleet_budget / agent_max_correction) as usize;
+println!("Max agents under conservation budget: {}", max_agents);
 ```
 
-### Health Status
+## si-cli Integration
 
-```rust
-use agent_homeostasis_rs::regulator::{HomeostaticRegulator, HealthStatus, ParameterStatus};
-use agent_homeostasis_rs::actuator::{Action, ActionType};
-
-fn health_check() {
-    let reg = HomeostaticRegulator::new();
-
-    // All stable
-    let statuses = vec![ParameterStatus {
-        name: "temp".into(),
-        current: 37.0,
-        target: 37.0,
-        deviation: 0.0,
-        is_stable: true,
-        action: Action::hold("temp"),
-    }];
-    assert_eq!(reg.health_status(&statuses), HealthStatus::Stable);
-
-    // Some correcting
-    let statuses = vec![ParameterStatus {
-        name: "temp".into(),
-        current: 39.0,
-        target: 37.0,
-        deviation: 2.0,
-        is_stable: false,
-        action: Action::new("temp", ActionType::Decrease, 1.0),
-    }];
-    assert_eq!(reg.health_status(&statuses), HealthStatus::Correcting);
-}
-```
-
-## API Reference
-
-### `control_loop` Module
-
-| Type/Function | Description |
-|---|---|
-| `PidController` | PID controller for a single parameter |
-| `PidResult` | Output + error + P/I/D term breakdown |
-| `ControlLoop` | Multi-parameter PID control loop |
-| `PidController::new(name, kp, ki, kd, target)` | Create a PID controller |
-| `.with_integral_limit(limit)` | Set anti-windup clamp |
-| `.with_output_limit(limit)` | Set output clamp |
-| `controller.update(measurement)` | Compute one PID step |
-| `control_loop.simulate(initial, steps)` | Run full trajectory |
-| `control_loop.tick(measurements)` | One step for all controllers |
-
-### `sensor` Module
-
-| Type/Function | Description |
-|---|---|
-| `Sensor` | Single parameter sensor with optional noise |
-| `SensorReading` | Reading with value, noise, raw, and SNR |
-| `SensorArray` | Multi-sensor simultaneous reading |
-| `Sensor::new(name)` | Noiseless sensor |
-| `Sensor::with_noise(name, scale)` | Noisy sensor |
-| `SensorReading::perfect(name, value)` | Noiseless reading |
-| `reading.snr()` | Signal-to-noise ratio |
-
-### `actuator` Module
-
-| Type/Function | Description |
-|---|---|
-| `Actuator` | Corrective action computer |
-| `Action` | A specific correction (type + magnitude) |
-| `ActionType` | Increase / Decrease / Hold |
-| `Actuator::new(param, max_mag, gain)` | Create actuator |
-| `.with_dead_zone(dz)` | Ignore small deviations |
-| `actuator.compute_action(deviation)` | Get correction |
-| `action.apply(current)` | Apply to get new value |
-
-### `setpoint` Module
-
-| Type/Function | Description |
-|---|---|
-| `Setpoint` | Target + tolerance + drift config |
-| `SetpointTracker` | Track satisfaction rate over time |
-| `Setpoint::new(name, target, tolerance)` | Symmetric tolerance |
-| `.with_drift(rate)` | Enable target drift per tick |
-| `.with_target_bounds(min, max)` | Clamp target drift |
-| `sp.is_satisfied(value)` | Within tolerance? |
-| `sp.deviation(value)` | Signed deviation |
-| `sp.normalized_deviation(value)` | -1 to +1 |
-
-### `regulator` Module
-
-| Type/Function | Description |
-|---|---|
-| `HomeostaticRegulator` | Ties setpoints + actuators |
-| `ParameterStatus` | Per-parameter status after regulation |
-| `HealthStatus` | Stable / Correcting / Critical |
-| `regulator.cycle(readings)` | Full read → correct → new values |
-| `regulator.regulate(readings)` | Get statuses only |
-| `regulator.health_status(statuses)` | Overall health |
-
-## Building and Testing
+`si-cli` uses agent-homeostasis-rs to manage agent regulation policies:
 
 ```bash
-cargo build
+# Set agent parameters
+si agent setpoint --name energy --target 100 --tolerance 10
+si agent setpoint --name attention --target 0.8 --tolerance 0.1
+
+# Check agent health
+si agent health
+# → STABLE: all parameters within tolerance
+
+# Run regulation cycle
+si agent regulate --cycles 100
+```
+
+## si-fleet-api Integration
+
+The fleet API exposes homeostasis data over HTTP:
+
+```
+GET /v1/agents/{agent_id}/homeostasis
+→ {
+    "parameters": [
+        {"name": "energy", "current": 85.0, "target": 100.0, "stable": false},
+        {"name": "attention", "current": 0.82, "target": 0.8, "stable": true}
+    ],
+    "health": "Correcting"
+}
+```
+
+## Supabase Integration
+
+Agent homeostasis state is stored in Supabase:
+
+```sql
+CREATE TABLE agent_setpoints (
+    agent_id UUID REFERENCES agents(id),
+    parameter TEXT NOT NULL,
+    target FLOAT NOT NULL,
+    tolerance FLOAT NOT NULL,
+    min_bound FLOAT,
+    max_bound FLOAT,
+    PRIMARY KEY (agent_id, parameter)
+);
+
+CREATE TABLE agent_regulation_log (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    agent_id UUID REFERENCES agents(id),
+    parameter TEXT NOT NULL,
+    value FLOAT NOT NULL,
+    target FLOAT NOT NULL,
+    deviation FLOAT NOT NULL,
+    correction FLOAT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+## Architecture
+
+```
+src/
+├── lib.rs           — Module declarations
+├── regulator.rs     — HomeostaticRegulator, ParameterStatus, HealthStatus
+├── sensor.rs        — Sensor, SensorReading, SensorArray
+├── actuator.rs      — Actuator, Action, ActionType
+├── control_loop.rs  — PidController, PidResult, ControlLoop
+└── setpoint.rs      — Setpoint, SetpointTracker
+```
+
+## Testing
+
+```bash
 cargo test
 ```
+
+Tests cover:
+- PID proportional, integral, derivative terms
+- Anti-windup and output clamping
+- Control loop convergence simulation
+- Sensor noise and SNR
+- Actuator dead zone and magnitude limits
+- Setpoint satisfaction, deviation, drift
+- Regulator health status transitions
+- Multi-cycle convergence
 
 ## License
 
