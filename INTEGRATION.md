@@ -1,273 +1,159 @@
-# INTEGRATION.md — agent-homeostasis-rs × ga-core × symplectic-opt
+# INTEGRATION.md — agent-homeostasis-rs × conservation-law-rs × fleet-warden-rs
 
-**Geometric self-regulation**: PID controllers in the language of geometric algebra and symplectic geometry.
+**Agent homeostasis** provides PID control loops, sensors, actuators, and
+regulators to maintain stable internal conditions. It connects to
+Lagrangian mechanics for energy-based setpoints and to fleet-warden for
+infrastructure health regulation.
 
 ## Synergy Map
 
 ```
-agent-homeostasis-rs          ga-core               symplectic-opt
-┌──────────────────┐    ┌───────────────┐    ┌─────────────────────┐
-│ PidController    │    │ Multivector   │    │ SymplecticMatrix    │
-│ ControlLoop      │◄──►│ Rotor         │◄──►│ HamiltonianSystem   │
-│ Setpoint         │    │ Conformal     │    │ EnergyTracker       │
-│ Sensor / Actuator│    │ (geometric    │    │ NaturalGradient     │
-│ Regulator        │    │  product)     │    │ ConservationLaw     │
-└──────────────────┘    └───────────────┘    └─────────────────────┘
-         │                      │                       │
-         └──────────────────────┼───────────────────────┘
-                                ▼
-                    Geometric PID: corrections as
-                    multivector rotations preserving
-                    symplectic structure
+conservation-law-rs            agent-homeostasis-rs           fleet-warden-rs
+┌──────────────────┐          ┌──────────────────────┐       ┌─────────────────┐
+│ AgentState        │◄────────►│ HomeostaticRegulator │◄─────►│ DiskBudget      │
+│ total_energy      │          │ PidController        │       │ full_scan       │
+│ SymplecticIntegr  │          │ SensorArray          │       │ disk_budget     │
+│ verify_noether    │          │ Actuator             │       │ BudgetSample    │
+└──────────────────┘          │ Setpoint             │       └─────────────────┘
+                              │ ControlLoop          │
+                              └──────────────────────┘
 ```
 
 ## Key Insight
 
-A PID controller adjusts scalar parameters. But when agents live in high-dimensional configuration spaces, corrections should be geometric — rotations in the agent's state space that preserve energy. ga-core provides the rotation machinery (rotors via sandwich products), symplectic-opt ensures the correction preserves the symplectic form, and agent-homeostasis-rs provides the feedback loop.
+An agent's internal state (energy, temperature, load) must stay within
+bounds. Homeostatic regulation treats these as setpoints with feedback
+correction. Conservation-law provides the physical model (energy as a
+conserved quantity), and fleet-warden extends this to infrastructure
+(disk, memory) as regulated parameters.
 
-## Example 1: Symplectic PID Controller
+## Example 1: Energy-Based Setpoint Regulation
 
-Use a Hamiltonian system to drive PID corrections that conserve energy:
+Use total energy from conservation-law as the regulated parameter.
 
 ```rust
-use agent_homeostasis_rs::control_loop::{PidController, PidResult};
-use symplectic_opt::hamiltonian::SeparableHamiltonian;
-use symplectic_opt::conservation::EnergyTracker;
-use symplectic_opt::symplectic::SymplecticMatrix;
+use conservation_law::lagrangian::{AgentState, MechanicalLagrangian, total_energy};
+use agent_homeostasis::{PidController, Setpoint, SensorReading};
 
-/// A PID controller whose corrections are symplectically constrained.
-/// The PID output is projected onto the nearest symplectic update,
-/// ensuring energy conservation during regulation.
-struct SymplecticPid {
-    pid: PidController,
-    hamiltonian: SeparableHamiltonian,
-    energy_tracker: EnergyTracker,
+fn regulate_energy() {
+    let lagrangian = MechanicalLagrangian {
+        mass: 1.0,
+        potential_fn: |q: &[f64; 1]| 0.5 * q[0] * q[0],
+    };
+    let state = AgentState::new([2.0], [0.0]);
+    let e0 = total_energy(&lagrangian, &state);
+
+    let mut pid = PidController::new("energy", 0.5, 0.05, 0.1, e0);
+    let measurement = total_energy(&lagrangian, &AgentState::new([2.1], [0.0]));
+
+    let result = pid.update(measurement);
+    println!("Energy error: {:.4}, correction: {:.4}", result.error, result.output);
 }
+```
 
-impl SymplecticPid {
-    fn new(
-        name: &str,
-        kp: f64, ki: f64, kd: f64,
-        target: f64,
-        masses: Vec<f64>,
-        potential_coeffs: Vec<f64>,
-    ) -> Self {
-        let pid = PidController::new(name, kp, ki, kd, target);
-        let hamiltonian = SeparableHamiltonian::new(masses, potential_coeffs);
-        let energy_tracker = EnergyTracker::from_energy(0.0);
+## Example 2: Multi-Parameter Agent Regulation
 
-        Self { pid, hamiltonian, energy_tracker }
+Regulate temperature and energy simultaneously with a ControlLoop.
+
+```rust
+use agent_homeostasis::{ControlLoop, PidController, SensorArray, Sensor};
+
+fn regulate_agent() {
+    let mut loop_ctrl = ControlLoop::new();
+    loop_ctrl.add(PidController::new("temp", 0.3, 0.02, 0.1, 37.0));
+    loop_ctrl.add(PidController::new("energy", 0.2, 0.01, 0.05, 100.0));
+
+    let mut sensors = SensorArray::new();
+    sensors.add(Sensor::new("temp"));
+    sensors.add(Sensor::new("energy"));
+
+    let mut values = vec![39.0, 85.0];
+    for _ in 0..50 {
+        let readings = sensors.read_all(&values);
+        let results = loop_ctrl.tick(&readings.iter().map(|r| r.value).collect::<Vec<_>>());
+        for (i, r) in results.iter().enumerate() {
+            values[i] += r.output;
+        }
     }
-
-    /// Update with symplectic correction.
-    fn update(&mut self, measurement: f64, q: &[f64], p: &[f64]) -> (PidResult, Vec<f64>, Vec<f64>) {
-        let result = self.pid.update(measurement);
-
-        // Use Störmer-Verlet to propagate the correction
-        let (new_q, new_p) = self.hamiltonian.stormer_verlet(q, p, result.output * 0.01, 1);
-
-        // Track energy
-        let energy = self.hamiltonian.energy(&new_q, &new_p);
-        self.energy_tracker.record(energy);
-
-        (result, new_q, new_p)
-    }
-
-    fn energy_conserved(&self) -> bool {
-        self.energy_tracker.is_conserved()
-    }
-
-    fn energy_drift(&self) -> f64 {
-        self.energy_tracker.max_drift()
-    }
+    println!("Final: temp={:.1}, energy={:.1}", values[0], values[1]);
 }
+```
 
-fn main() {
-    let mut spid = SymplecticPid::new(
-        "position",
-        2.0, 0.1, 0.5,     // PID gains
-        10.0,               // target position
-        vec![1.0, 1.0],     // masses
-        vec![0.5, 0.5],     // potential coefficients (harmonic)
+## Example 3: HomeostaticRegulator with Fleet-Warden Health
+
+Use the high-level regulator to monitor disk, memory, and CPU.
+
+```rust
+use agent_homeostasis::{HomeostaticRegulator, Setpoint, Actuator, SensorReading};
+use fleet_warden::budget::disk_budget;
+
+fn fleet_health_regulator() {
+    let mut reg = HomeostaticRegulator::new();
+
+    let disk_budget = disk_budget().unwrap();
+    let disk_used_pct = disk_budget.used_pct;
+
+    reg.add_parameter(
+        Setpoint::new("disk_usage", 70.0, 10.0),
+        Actuator::new("disk_usage", 5.0, 0.5),
     );
 
-    let q = vec![0.0, 0.0]; // initial position
-    let p = vec![0.0, 0.0]; // initial momentum
-
-    let (result, new_q, new_p) = spid.update(0.0, &q, &p);
-    println!("PID output: {:.4}", result.output);
-    println!("New position: {:?}", new_q);
-    println!("Energy conserved: {}", spid.energy_conserved());
-    println!("Max energy drift: {:.6}", spid.energy_drift());
-}
-```
-
-## Example 2: Geometric Rotation as Actuator Correction
-
-Use ga-core rotors to apply corrections as rotations in conformal space:
-
-```rust
-use agent_homeostasis_rs::actuator::{Actuator, ActionType};
-use agent_homeostasis_rs::setpoint::Setpoint;
-use ga_core::multivector::Multivector;
-use ga_core::rotor::Rotor;
-use ga_core::conformal::Conformal;
-
-/// Apply actuator corrections as conformal rotations instead of
-/// simple linear adjustments. This preserves the geometric structure
-/// of the agent's state space.
-fn geometric_correction(
-    current_state: [f64; 3],
-    target: [f64; 3],
-    actuator: &Actuator,
-    setpoint: &Setpoint,
-) -> [f64; 3] {
-    let deviation = setpoint.deviation(current_state[0]);
-
-    // Compute correction using the actuator
-    let action = actuator.compute_action(deviation);
-
-    if action.action_type == ActionType::Hold {
-        return current_state;
-    }
-
-    // Build a rotor that rotates current toward target
-    // The rotation axis is the cross product of current and target
-    let axis = [
-        current_state[1] * target[2] - current_state[2] * target[1],
-        current_state[2] * target[0] - current_state[0] * target[2],
-        current_state[0] * target[1] - current_state[1] * target[0],
+    let readings = vec![
+        SensorReading::perfect("disk_usage", disk_used_pct),
     ];
-    let axis_len = (axis[0]*axis[0] + axis[1]*axis[1] + axis[2]*axis[2]).sqrt();
-    if axis_len < 1e-10 {
-        return current_state; // already aligned
+
+    let (statuses, new_values) = reg.cycle(&readings);
+    for s in &statuses {
+        println!("{}: {:.1} -> target {:.1}, action: {:?}",
+            s.name, s.current, s.target, s.action.action_type);
     }
-    let axis_norm = [axis[0]/axis_len, axis[1]/axis_len, axis[2]/axis_len];
-
-    // Scale the rotation angle by the actuator's correction magnitude
-    let angle = action.magnitude * 0.1;
-    let rotor = Rotor::from_axis_angle(axis_norm, angle);
-
-    // Apply via sandwich product
-    rotor.apply(current_state)
-}
-
-fn main() {
-    let actuator = Actuator::new("position", 2.0, 0.5);
-    let setpoint = Setpoint::new("position", 10.0, 1.0);
-
-    let current = [3.0, 0.0, 0.0];
-    let target = [10.0, 0.0, 0.0];
-    let corrected = geometric_correction(current, target, &actuator, &setpoint);
-
-    println!("Current: {:?}", current);
-    println!("Corrected: {:?}", corrected);
-    println!("Moved toward target: {}", corrected[0] > current[0]);
 }
 ```
 
-## Example 3: Multi-Agent Regulation with Energy Conservation
+## Cargo.toml Wiring
 
-A fleet of agents, each regulated by homeostasis, with fleet-wide energy tracked via symplectic conservation:
+```toml
+[dependencies]
+agent-homeostasis = { git = "https://github.com/SuperInstance/agent-homeostasis-rs" }
+conservation-law = { git = "https://github.com/SuperInstance/conservation-law-rs" }
+fleet-warden = { git = "https://github.com/SuperInstance/fleet-warden-rs" }
+```
+
+## Design Patterns
+
+### Pattern: Cascading Setpoint Drift
+
+Model seasonal load changes by drifting setpoints gradually:
 
 ```rust
-use agent_homeostasis_rs::control_loop::{PidController, ControlLoop};
-use agent_homeostasis_rs::regulator::{HomeostaticRegulator, HealthStatus};
-use agent_homeostasis_rs::setpoint::Setpoint;
-use agent_homeostasis_rs::actuator::Actuator;
-use agent_homeostasis_rs::sensor::SensorReading;
-use symplectic_opt::conservation::EnergyTracker;
+use agent_homeostasis::setpoint::SetpointTracker;
+use agent_homeostasis::Setpoint;
 
-/// A fleet of agents where total computational energy is conserved.
-/// When one agent increases activity, others must decrease — the budget is fixed.
-struct ConservedFleet {
-    regulators: Vec<HomeostaticRegulator>,
-    energy_tracker: EnergyTracker,
-    total_budget: f64,
-}
+fn seasonal_load_adjustment(base_load: f64) -> Vec<f64> {
+    let mut tracker = SetpointTracker::new(
+        Setpoint::new("load", base_load, 10.0).with_drift(0.5)
+    );
 
-impl ConservedFleet {
-    fn new(n_agents: usize, budget_per_agent: f64) -> Self {
-        let mut regulators = Vec::new();
-        for i in 0..n_agents {
-            let mut reg = HomeostaticRegulator::new();
-            reg.add_parameter(
-                Setpoint::new("compute", budget_per_agent, budget_per_agent * 0.1),
-                Actuator::new("compute", budget_per_agent * 0.2, 0.5),
-            );
-            regulators.push(reg);
-        }
-
-        let total = n_agents as f64 * budget_per_agent;
-        let tracker = EnergyTracker::from_energy(total);
-
-        ConservedFleet {
-            regulators,
-            energy_tracker: tracker,
-            total_budget: total,
-        }
+    let mut targets = vec![];
+    for _ in 0..24 {
+        targets.push(tracker.tick_drift());
     }
-
-    fn tick(&mut self, agent_readings: &[Vec<SensorReading>]) -> Vec<HealthStatus> {
-        let mut statuses = Vec::new();
-        let mut total_energy = 0.0;
-
-        for (i, (reg, readings)) in self.regulators.iter().zip(agent_readings).enumerate() {
-            let (s, new_vals) = reg.cycle(readings);
-            total_energy += new_vals[0];
-            statuses.push(reg.health_status(&s));
-        }
-
-        // Track fleet energy — it should stay near total_budget
-        self.energy_tracker.record(total_energy);
-
-        statuses
-    }
-
-    fn energy_conserved(&self) -> bool {
-        self.energy_tracker.is_conserved()
-    }
-}
-
-fn main() {
-    let mut fleet = ConservedFleet::new(5, 100.0);
-
-    // All agents start at their setpoint
-    let readings: Vec<Vec<SensorReading>> = (0..5)
-        .map(|_| vec![SensorReading::perfect("compute", 100.0)])
-        .collect();
-
-    let statuses = fleet.tick(&readings);
-    for (i, s) in statuses.iter().enumerate() {
-        println!("Agent {}: {:?}", i, s);
-    }
-    println!("Fleet energy conserved: {}", fleet.energy_conserved());
+    targets
 }
 ```
 
-## Data Flow
+### Pattern: Sensor Redundancy
 
+Combine multiple sensors to tolerate individual failures:
+
+```rust
+use agent_homeostasis::sensor::SensorArray;
+
+fn fault_tolerant_reading(sensors: &mut SensorArray) -> f64 {
+    let readings = sensors.read_all();
+    let median = readings.iter().cloned()
+        .collect::<Vec<_>>()
+        .sort_by(|a, b| a.partial_cmp(b).unwrap());
+    readings[readings.len() / 2]
+}
 ```
-SensorReading ──► HomeostaticRegulator.cycle()
-                         │
-                         ▼
-                ParameterStatus + corrections
-                         │
-            ┌────────────┤
-            ▼            ▼
-    Rotor.apply()  SymplecticMatrix
-    (geometric     (preserves
-     rotation)      symplectic form)
-            │            │
-            └────────────┤
-                         ▼
-              EnergyTracker.record()
-              (verify conservation)
-```
-
-## When to Use This Combination
-
-- **Fleet coordination** where total compute budget is fixed (one agent's gain = another's loss)
-- **Robotics/physics** where corrections must preserve energy or momentum
-- **Geometric ML** where parameter updates should respect the manifold structure
-- **Multi-agent RL** where policy updates should be rotations, not arbitrary translations
